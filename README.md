@@ -118,5 +118,4 @@ The suite verifies:
 
 ## 📸 Demo
 
-- ![working app](demo1.png)
-- ![working app](demo2.png)
+<img src="demo1.png" width="300" alt="Entering User info 1"> <img src="demo2.png" width="300" alt="Schedule">
