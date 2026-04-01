@@ -125,86 +125,65 @@ def test_sorting_multiple_pets_mixed_tasks():
 # RECURRENCE LOGIC TESTS
 # ============================================================================
 
-def test_daily_task_creates_next_occurrence_on_completion():
-    """Marking a DAILY task complete creates a new Task instance for next occurrence."""
+def test_daily_task_hidden_from_plan_after_completion():
+    """DAILY task disappears from today's plan after being marked done."""
     owner = Owner("Alice")
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
+    pet.add_task(Task("Morning Walk", "Exercise", 30, 1, Frequency.DAILY))
+
+    scheduler = Scheduler(owner)
+    assert len(scheduler.generate_daily_plan()) == 1  # shows before completion
+
+    scheduler.mark_task_complete("Morning Walk")
+    assert len(scheduler.generate_daily_plan()) == 0  # hidden for rest of today
+    assert len(pet.tasks) == 1  # no clone created
+
+
+def test_daily_task_resets_for_new_day():
+    """DAILY task shows up again when last_completed_date is a previous day."""
+    from datetime import timedelta
+    owner = Owner("Alice")
+    pet = Pet(name="Max", type="Dog", age=5)
+    owner.add_pet(pet)
+
     task = Task("Morning Walk", "Exercise", 30, 1, Frequency.DAILY)
+    task.last_completed_date = date.today() - timedelta(days=1)  # completed yesterday
+    task.completed = True
     pet.add_task(task)
-    
-    # Before completion: 1 task
-    assert len(pet.tasks) == 1
-    assert pet.tasks[0].completed is False
-    
-    # Mark complete via scheduler
+
     scheduler = Scheduler(owner)
-    next_task = scheduler.mark_task_complete("Morning Walk")
-    
-    # After completion: 2 tasks (original + new)
-    assert len(pet.tasks) == 2
-    assert pet.tasks[0].completed is True
-    assert pet.tasks[1].completed is False
-    assert next_task is not None
-    assert next_task.title == "Morning Walk"
+    assert len(scheduler.generate_daily_plan()) == 1  # back in today's plan
 
 
-def test_daily_task_next_occurrence_is_independent():
-    """Next occurrence is a deep copy, not reference to original."""
+def test_twice_daily_shows_one_slot_after_first_completion():
+    """After completing a TWICE_DAILY task once, only 1 slot remains."""
     owner = Owner("Alice")
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
-    original_task = Task("Walk", "Exercise", 30, 1, Frequency.DAILY)
-    pet.add_task(original_task)
-    
+    pet.add_task(Task("Feed", "Meal", 5, 2, Frequency.TWICE_DAILY))
+
     scheduler = Scheduler(owner)
-    next_task = scheduler.mark_task_complete("Walk")
-    
-    # Modify original task
-    original_task.priority = 5
-    original_task.duration = 60
-    
-    # Next task should not be affected
-    assert next_task.priority == 1
-    assert next_task.duration == 30
+    assert len(scheduler.generate_daily_plan()) == 2  # starts with 2 slots
+
+    scheduler.mark_task_complete("Feed")
+    assert len(scheduler.generate_daily_plan()) == 1  # 1 slot remaining
+    assert len(pet.tasks) == 1  # no clone created
 
 
-def test_twice_daily_task_creates_next_occurrence():
-    """Marking a TWICE_DAILY task complete creates new instance."""
+def test_weekly_task_hidden_after_completion_no_clone():
+    """WEEKLY task is hidden after completion; no clone is created."""
     owner = Owner("Alice")
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
-    task = Task("Feed", "Meal", 5, 2, Frequency.TWICE_DAILY)
-    pet.add_task(task)
-    
-    assert len(pet.tasks) == 1
-    scheduler = Scheduler(owner)
-    next_task = scheduler.mark_task_complete("Feed")
-    
-    # New task created
-    assert len(pet.tasks) == 2
-    assert next_task is not None
-    assert next_task.frequency == Frequency.TWICE_DAILY
+    pet.add_task(Task("Groom", "Grooming", 60, 1, Frequency.WEEKLY))
 
-
-def test_weekly_task_creates_next_occurrence():
-    """Marking a WEEKLY task complete creates new instance."""
-    owner = Owner("Alice")
-    pet = Pet(name="Max", type="Dog", age=5)
-    owner.add_pet(pet)
-    
-    task = Task("Groom", "Grooming", 60, 1, Frequency.WEEKLY)
-    pet.add_task(task)
-    
     scheduler = Scheduler(owner)
-    next_task = scheduler.mark_task_complete("Groom")
-    
-    assert next_task is not None
-    assert next_task.frequency == Frequency.WEEKLY
-    assert len(pet.tasks) == 2
+    assert len(scheduler.generate_daily_plan()) == 1
+
+    scheduler.mark_task_complete("Groom")
+    assert len(scheduler.generate_daily_plan()) == 0
+    assert len(pet.tasks) == 1  # no clone created
 
 
 def test_as_needed_task_no_next_occurrence():
@@ -218,10 +197,8 @@ def test_as_needed_task_no_next_occurrence():
     
     assert len(pet.tasks) == 1
     scheduler = Scheduler(owner)
-    next_task = scheduler.mark_task_complete("Medication")
-    
-    # No next task created
-    assert next_task is None
+    scheduler.mark_task_complete("Medication")
+
     assert len(pet.tasks) == 1
     assert pet.tasks[0].completed is True
 
@@ -337,12 +314,12 @@ def test_no_conflict_when_within_daily_limit():
 
 
 def test_conflict_when_exceeds_daily_limit():
-    """Conflict flagged when total pet task duration > 120 minutes."""
-    owner = Owner("Alice")
+    """Conflict flagged when total pet task duration > owner's available minutes."""
+    owner = Owner("Alice", availability="9am-11am")  # 120 min window
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
-    # 3 tasks × 50 min = 150 min total (over 120)
+
+    # 3 tasks × 50 min = 150 min total (over 120 min window)
     pet.add_task(Task("Walk1", "Exercise", 50, 1, Frequency.DAILY))
     pet.add_task(Task("Walk2", "Exercise", 50, 2, Frequency.DAILY))
     pet.add_task(Task("Feed", "Meal", 50, 3, Frequency.DAILY))
@@ -355,12 +332,12 @@ def test_conflict_when_exceeds_daily_limit():
 
 
 def test_conflict_exactly_at_120_minute_boundary():
-    """Exactly 120 minutes does NOT trigger conflict (≤ 120 is OK)."""
-    owner = Owner("Alice")
+    """Exactly at the available window does NOT trigger conflict."""
+    owner = Owner("Alice", availability="9am-11am")  # 120 min window
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
-    # Exactly 120 min
+
+    # Exactly 120 min (equal to window — no conflict)
     pet.add_task(Task("Task1", "Exercise", 60, 1, Frequency.DAILY))
     pet.add_task(Task("Task2", "Exercise", 60, 2, Frequency.DAILY))
     
@@ -371,12 +348,12 @@ def test_conflict_exactly_at_120_minute_boundary():
 
 
 def test_conflict_just_over_120_minute_boundary():
-    """121 minutes triggers conflict (> 120)."""
-    owner = Owner("Alice")
+    """One minute over the available window triggers a conflict."""
+    owner = Owner("Alice", availability="9am-11am")  # 120 min window
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
-    # 121 min total
+
+    # 121 min total (1 min over the window)
     pet.add_task(Task("Task1", "Exercise", 60, 1, Frequency.DAILY))
     pet.add_task(Task("Task2", "Exercise", 61, 2, Frequency.DAILY))
     
@@ -387,16 +364,13 @@ def test_conflict_just_over_120_minute_boundary():
 
 
 def test_conflict_detection_multiple_pets():
-    """Conflict detection works independently for each pet."""
-    owner = Owner("Alice")
-    
-    # Dog: 150 min (conflict)
+    """Conflict detection uses the combined task duration across all pets."""
+    owner = Owner("Alice", availability="9am-11am")  # 120 min window
+
     dog = Pet(name="Max", type="Dog", age=5)
-    dog.add_task(Task("Walk", "Exercise", 60, 1, Frequency.DAILY))
-    dog.add_task(Task("Play", "Exercise", 90, 2, Frequency.DAILY))
+    dog.add_task(Task("Walk", "Exercise", 80, 1, Frequency.DAILY))
     owner.add_pet(dog)
-    
-    # Cat: 50 min (no conflict)
+
     cat = Pet(name="Whiskers", type="Cat", age=3)
     cat.add_task(Task("Feed", "Meal", 50, 1, Frequency.DAILY))
     owner.add_pet(cat)
@@ -404,17 +378,18 @@ def test_conflict_detection_multiple_pets():
     scheduler = Scheduler(owner)
     conflicts = scheduler.detect_conflicts()
     
-    # Only dog should have conflict
-    assert len(conflicts) > 0
-    assert "Max" in conflicts[0][2]
+    assert len(conflicts) == 1
+    assert "HIGH LOAD" in conflicts[0][2]
+    assert "Alice" in conflicts[0][2]
 
 
 def test_conflict_message_format():
     """Conflict warning contains pet name and task titles."""
-    owner = Owner("Alice")
+    owner = Owner("Alice", availability="9am-11am")  # 120 min window
     pet = Pet(name="Max", type="Dog", age=5)
     owner.add_pet(pet)
-    
+
+    # 130 min total (over 120 min window)
     pet.add_task(Task("Walk", "Exercise", 80, 1, Frequency.DAILY))
     pet.add_task(Task("Play", "Exercise", 50, 2, Frequency.DAILY))
     
@@ -423,12 +398,7 @@ def test_conflict_message_format():
     
     assert len(conflicts) > 0
     warning = conflicts[0][2]
-    assert "Max" in warning
-    assert "130" in warning  # Total duration
-    assert "Walk" in warning or "Play" in warning
-
-
-def test_conflict_detection_respects_weekly_skip():
+    assert "Alice" in warning
     """Weekly tasks skipped don't count toward conflict load."""
     owner = Owner("Alice")
     pet = Pet(name="Max", type="Dog", age=5)

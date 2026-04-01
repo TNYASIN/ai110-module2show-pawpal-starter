@@ -2,7 +2,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 from enum import Enum
 from datetime import date, timedelta
-from copy import deepcopy
 
 
 class Frequency(Enum):
@@ -41,42 +40,31 @@ class Task:
         self.frequency = frequency
 
     def mark_complete(self):
-        """Mark task as complete and set completion date.
-        
-        For recurring tasks (DAILY, TWICE_DAILY, WEEKLY), also returns
-        a new task instance for the next occurrence.
-        """
         today = date.today()
         if self.last_completed_date != today:
-            self.times_completed_today = 0
+            self.times_completed_today = 0  # new day — reset counter
         self.times_completed_today += 1
         self.last_completed_date = today
         self.completed = True
-    
-    def create_next_occurrence(self) -> Optional['Task']:
-        """Create a new task instance for the next occurrence if frequency is recurring.
-        
-        Returns:
-            A new Task with updated due date for daily/weekly tasks, or None for AS_NEEDED.
+
+    def is_done(self, slot: int = 1) -> bool:
+        """Whether this task's nth slot has been completed today.
+        Accounts for day boundaries so previous-day completions don't show as done.
+        slot is only meaningful for TWICE_DAILY (1 or 2).
         """
-        if self.frequency == Frequency.AS_NEEDED:
-            return None
-        
-        # Create a deep copy of the current task
-        next_task = deepcopy(self)
-        next_task.completed = False
-        next_task.times_completed_today = 0
-        
-        # Calculate next due date based on frequency
-        if self.frequency == Frequency.DAILY:
-            next_task.last_completed_date = None
-        elif self.frequency == Frequency.TWICE_DAILY:
-            next_task.last_completed_date = None
+        today = date.today()
+        if self.frequency == Frequency.TWICE_DAILY:
+            completed_today = (self.last_completed_date == today)
+            done_count = self.times_completed_today if completed_today else 0
+            return done_count >= slot
         elif self.frequency == Frequency.WEEKLY:
-            # For weekly tasks, reset so they can appear in next week's plan
-            next_task.last_completed_date = None
-        
-        return next_task
+            return bool(self.last_completed_date and
+                        (today - self.last_completed_date).days < 7)
+        elif self.frequency == Frequency.DAILY:
+            return self.last_completed_date == today
+        else:  # AS_NEEDED
+            return self.completed
+    
 
     def __str__(self):
         status = "✓" if self.completed else "○"
@@ -137,6 +125,54 @@ class Owner:
     def set_preferences(self, preferences: str):
         self.preferences = preferences
 
+    def get_available_minutes(self) -> int:
+        """Parse availability string into total available minutes.
+
+        Handles formats like '8am-6pm', '9:00-17:00', '8h', '8 hours', and '480 min'.
+        Returns 480 (8 hours) as a safe default if the string can't be parsed.
+        """
+        import re
+        if not self.availability:
+            return 480
+
+        text = self.availability.strip().lower()
+
+        # Handle explicit hour-based values like '8h' or '8 hours'
+        hour_match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*(h|hr|hrs|hour|hours)$", text)
+        if hour_match:
+            hours = float(hour_match.group(1))
+            return max(int(hours * 60), 60)
+
+        # Handle explicit minute-based values like '480 min' or '480 minutes'
+        minute_match = re.match(r"^([0-9]+)\s*(m|min|mins|minute|minutes)$", text)
+        if minute_match:
+            minutes = int(minute_match.group(1))
+            return max(minutes, 60)
+
+        # Match patterns like "8am-6pm", "8:30am-5:30pm", "9:00-17:00"
+        pattern = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[-–]\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+        match = re.search(pattern, text)
+        if match:
+            start_h, start_m, start_period, end_h, end_m, end_period = match.groups()
+            start_h, end_h = int(start_h), int(end_h)
+            start_m = int(start_m) if start_m else 0
+            end_m = int(end_m) if end_m else 0
+
+            # Convert to 24h
+            if start_period == "pm" and start_h != 12:
+                start_h += 12
+            if start_period == "am" and start_h == 12:
+                start_h = 0
+            if end_period == "pm" and end_h != 12:
+                end_h += 12
+            if end_period == "am" and end_h == 12:
+                end_h = 0
+
+            total = (end_h * 60 + end_m) - (start_h * 60 + start_m)
+            return max(total, 60)
+
+        return 480
+
     def add_pet(self, pet: Pet):
         self.pets.append(pet)
 
@@ -173,67 +209,50 @@ class Scheduler:
 
         for task in self.owner.get_all_tasks():
             if task.frequency == Frequency.WEEKLY:
-                # skip if completed within the last 7 days
-                if task.last_completed_date and (today - task.last_completed_date).days < 7:
+                if task.is_done():
                     continue
                 slots.append(task)
             elif task.frequency == Frequency.TWICE_DAILY:
-                # add two slots; mark label with (1/2) and (2/2)
+                # Only include remaining (uncompleted) slots for today
+                completed_today = (task.last_completed_date == today)
+                done_count = task.times_completed_today if completed_today else 0
+                for _ in range(2 - done_count):
+                    slots.append(task)
+            elif task.frequency == Frequency.DAILY:
+                if task.is_done():
+                    continue  # done today; reappears tomorrow
                 slots.append(task)
-                slots.append(task)
-            else:
-                # DAILY or AS_NEEDED
+            else:  # AS_NEEDED
                 slots.append(task)
 
         return sorted(slots, key=lambda t: (t.priority, t.duration))
     
-    def detect_conflicts(self, assume_sequential: bool = False) -> List[Tuple[Task, Task, str]]:
-        """Detect task conflicts where two tasks for the same pet would overlap in time.
-        
-        This uses a lightweight strategy:
-        - By default, assumes all tasks are scheduled sequentially (no overlaps if they fit)
-        - If assume_sequential=False, flags any two tasks on same pet for the same day
-          (warns that they need time-slot assignment to avoid conflicts)
-        
-        Args:
-            assume_sequential: If True, only warns if total duration exceeds a reasonable daily limit
-            
-        Returns:
-            List of tuples (task1, task2, warning_message) for detected conflicts.
+    def detect_conflicts(self, plan: List[Task] = None) -> List[Tuple[Task, Task, str]]:
+        """Detect schedule conflicts based on the owner's total available minutes.
+
+        If a plan is supplied, conflict detection evaluates that exact schedule.
+        Otherwise it falls back to the standard daily plan.
         """
-        conflicts: List[Tuple[Task, Task, str]] = []
-        all_tasks = self.owner.get_all_tasks()
-        
-        # Group tasks by pet to check same-pet scheduling
-        tasks_by_pet = {}
-        for task in all_tasks:
-            if task.pet_name not in tasks_by_pet:
-                tasks_by_pet[task.pet_name] = []
-            tasks_by_pet[task.pet_name].append(task)
-        
-        # For each pet, check if total daily task time is reasonable
-        plan = self.generate_daily_plan()
-        for pet_name, pet_tasks in tasks_by_pet.items():
-            # Get tasks for this pet in today's plan
-            pet_plan_tasks = [t for t in plan if t.pet_name == pet_name]
-            
-            if pet_plan_tasks:
-                total_duration = sum(t.duration for t in pet_plan_tasks)
-                # Flag if total exceeds reasonable daily limit (e.g., 120 minutes per pet)
-                if total_duration > 120:
-                    for i, task1 in enumerate(pet_plan_tasks):
-                        for task2 in pet_plan_tasks[i + 1:]:
-                            warning = (
-                                f"⚠️ HIGH LOAD: {pet_name} has {total_duration} min of tasks today. "
-                                f"'{task1.title}' and '{task2.title}' may need scheduling. "
-                                f"Consider spreading tasks or adjusting priorities."
-                            )
-                            # Only add once per pet, not per task pair
-                            if not any(w[2] == warning for w in conflicts):
-                                conflicts.append((task1, task2, warning))
-                            return conflicts
-        
-        return conflicts
+        if plan is None:
+            plan = self.generate_daily_plan()
+
+        daily_limit = self.owner.get_available_minutes()
+        total_duration = sum(t.duration for t in plan)
+
+        if total_duration <= daily_limit:
+            return []
+
+        task1 = plan[0] if plan else None
+        task2 = plan[1] if len(plan) > 1 else (plan[0] if plan else None)
+        warning = (
+            f"⚠️ HIGH LOAD: the schedule has {total_duration} min of tasks today "
+            f"but {self.owner.name} is available for {daily_limit} min "
+            f"({self.owner.availability or 'no availability set'}). "
+            f"'{task1.title if task1 else 'Task'}' and '{task2.title if task2 else 'Task'}' may not both fit. "
+            "Consider spreading tasks or adjusting priorities."
+        )
+
+        return [(task1, task2, warning)] if task1 and task2 else []
     
     def print_conflicts(self):
         """Print all detected conflicts in a user-friendly format."""
@@ -310,11 +329,17 @@ class Scheduler:
         # Collect slots respecting frequency rules (same as generate_daily_plan)
         for task in self.owner.get_all_tasks():
             if task.frequency == Frequency.WEEKLY:
-                if task.last_completed_date and (today - task.last_completed_date).days < 7:
+                if task.is_done():
                     continue
                 slots.append(task)
             elif task.frequency == Frequency.TWICE_DAILY:
-                slots.append(task)
+                completed_today = (task.last_completed_date == today)
+                done_count = task.times_completed_today if completed_today else 0
+                for _ in range(2 - done_count):
+                    slots.append(task)
+            elif task.frequency == Frequency.DAILY:
+                if task.is_done():
+                    continue
                 slots.append(task)
             else:
                 slots.append(task)
@@ -376,27 +401,13 @@ class Scheduler:
     def filter_by_priority(self, priority: int) -> List[Task]:
         return [t for t in self.owner.get_all_tasks() if t.priority == priority]
 
-    def mark_task_complete(self, task_title: str) -> Optional[Task]:
-        """Mark a task as complete by title across all pets.
-        
-        For recurring tasks, automatically creates a new instance for the next occurrence.
-        
-        Args:
-            task_title: The title of the task to mark complete
-            
-        Returns:
-            The newly created recurring task, or None if task is AS_NEEDED or not found
+    def mark_task_complete(self, task_title: str) -> None:
+        """Mark a task complete. Recurrence is handled automatically by date tracking —
+        daily tasks reappear tomorrow, twice-daily after the second slot, weekly after 7 days.
         """
         for pet in self.owner.pets:
             for task in pet.tasks:
                 if task.title == task_title:
                     task.mark_complete()
-                    
-                    # Create next occurrence for recurring tasks
-                    next_task = task.create_next_occurrence()
-                    if next_task:
-                        pet.add_task(next_task)
-                        return next_task
-                    return None
-        
+                    return
         raise ValueError(f"Task '{task_title}' not found.")

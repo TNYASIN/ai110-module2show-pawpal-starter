@@ -103,24 +103,17 @@ print("   • Recency (days since completion): 30%")
 print("   • Frequency pattern (recurring vs one-off): 20%")
 print("   This creates a composite urgency score for smarter ordering.")
 
-# --- Recurring Task Automation Demo ---
+# --- Mark Complete Demo ---
 print("\n" + "=" * 50)
-print("RECURRING TASK AUTOMATION DEMO")
+print("MARK COMPLETE DEMO")
 print("=" * 50)
-print(f"\nLuna's tasks BEFORE marking 'Morning Walk' complete: {len(luna.tasks)}")
-for i, task in enumerate(luna.tasks, 1):
-    print(f"  {i}. {task.title}")
+print(f"\nPlan BEFORE marking 'Morning Walk' complete ({len(scheduler.generate_daily_plan())} slots):")
+scheduler.view_plan()
 
-new_task = scheduler.mark_task_complete("Morning Walk")
+scheduler.mark_task_complete("Morning Walk")
 print(f"\n✓ Marked 'Morning Walk' as complete!")
-if new_task:
-    print(f"→ Auto-created new task for next occurrence: '{new_task.title}'")
-    print(f"  (Reset for next daily cycle)")
-
-print(f"\nLuna's tasks AFTER: {len(luna.tasks)}")
-for i, task in enumerate(luna.tasks, 1):
-    status = "✓" if task.completed else "○"
-    print(f"  {status} {i}. {task.title}")
+print(f"\nPlan AFTER ({len(scheduler.generate_daily_plan())} slots — Morning Walk hidden until tomorrow):")
+scheduler.view_plan()
 
 
 
